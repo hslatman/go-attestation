@@ -210,13 +210,26 @@ func (k *windowsAK20) certify(tb tpmBase, handle interface{}, qualifyingData []b
 	if err != nil {
 		return nil, fmt.Errorf("TPMKeyHandle() failed: %v", err)
 	}
-	tpm, err := t.pcp.TPMCommandInterface()
+	akPub, err := ParseAKPublic(TPMVersion20, k.attestationParameters().Public)
 	if err != nil {
-		return nil, fmt.Errorf("TPMCommandInterface() failed: %v", err)
+		return nil, fmt.Errorf("ParseAKPublic() failed: %v", err)
+	}
+	var hash tpm2.Algorithm
+	switch akPub.Hash {
+	case crypto.SHA256:
+		hash = tpm2.AlgSHA256
+	case crypto.SHA1:
+		hash = tpm2.AlgSHA1
+	default:
+		return nil, fmt.Errorf("invalid hash algorithm read from AK: %d", akPub.Hash)
 	}
 	scheme := tpm2.SigScheme{
 		Alg:  tpm2.AlgRSASSA,
-		Hash: tpm2.AlgSHA1, // PCP-created AK uses SHA1
+		Hash: hash,
+	}
+	tpm, err := t.pcp.TPMCommandInterface()
+	if err != nil {
+		return nil, fmt.Errorf("TPMCommandInterface() failed: %v", err)
 	}
 	return certify(tpm, hnd, akHnd, qualifyingData, scheme)
 }
