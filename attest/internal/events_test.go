@@ -65,3 +65,55 @@ func TestParseUEFIVariableData(t *testing.T) {
 		t.Errorf("ParseUEFIVariableData() mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestParseEfiSignatureListOversizedSignatureHeaderSize(t *testing.T) {
+	sigType := [16]byte{
+		0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40,
+		0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28,
+	}
+	const (
+		sha256HashSize = 32
+		sigSize        = efiGUIDSize + sha256HashSize
+	)
+	// sigHeaderSize == remainingListSize: consumes all remaining space.
+	// The bound check must reject this.
+	sigHeaderSize := sigSize
+	sigListSize := uint32(efiSignatureListHeaderSize + sigHeaderSize)
+	data := buildEFISignatureListData(sigType, sigListSize, uint32(sigHeaderSize), sigSize, 0)
+	_, _, err := parseEfiSignatureList(data)
+	if err == nil {
+		t.Error("parseEfiSignatureList() accepted oversized SignatureHeaderSize, want error")
+	}
+}
+
+func TestParseEfiSignatureListVendorHeaderNotTrusted(t *testing.T) {
+	sigType := [16]byte{
+		0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40,
+		0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28,
+	}
+	const (
+		sha256HashSize   = 32
+		sigSize          = efiGUIDSize + sha256HashSize
+		vendorHeaderSize = sha256HashSize // smaller than sigSize so bound check passes
+	)
+	// Attacker-controlled vendor header bytes.
+	attackerBytes := bytes.Repeat([]byte{0xAA}, vendorHeaderSize)
+	// One legitimate entry.
+	legitHash := bytes.Repeat([]byte{0xBB}, sha256HashSize)
+	legitEntry := make([]byte, sigSize)
+	copy(legitEntry[efiGUIDSize:], legitHash)
+	sigListSize := uint32(efiSignatureListHeaderSize + vendorHeaderSize + len(legitEntry))
+	data := buildEFISignatureListData(sigType, sigListSize, vendorHeaderSize, sigSize, 0)
+	data = append(data, attackerBytes...)
+	data = append(data, legitEntry...)
+	_, hashes, err := parseEfiSignatureList(data)
+	if err != nil {
+		t.Fatalf("parseEfiSignatureList() returned unexpected error: %v", err)
+	}
+	if len(hashes) != 1 {
+		t.Fatalf("parseEfiSignatureList returned %d hashes, expected 1, hashes: %v", len(hashes), hashes)
+	}
+	if !bytes.Equal(hashes[0], legitHash) {
+		t.Errorf("parseEfiSignatureList returned hash %x, expected %x", hashes[0], legitHash)
+	}
+}
