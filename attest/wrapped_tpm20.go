@@ -27,7 +27,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"runtime"
 
+	"github.com/google/go-attestation/tcg"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
 )
@@ -51,20 +53,20 @@ type certifyingKey struct {
 
 func rsaEkTemplate(rwc io.ReadWriter) tpm2.Public {
 	if rwc == nil {
-		return defaultRSAEKTemplate
+		return tcg.DefaultRSA2048EKTemplate
 	}
-	nonce, err := tpm2.NVReadEx(rwc, nvramRSAEkNonceIndex, tpm2.HandleOwner, "", 0)
+	nonce, err := tpm2.NVReadEx(rwc, tcg.EKNonceRSA2048Index, tpm2.HandleOwner, "", 0)
 	if err != nil {
-		return defaultRSAEKTemplate
+		return tcg.DefaultRSA2048EKTemplate
 	}
-	template := defaultRSAEKTemplate
+	template := tcg.DefaultRSA2048EKTemplate
 	copy(template.RSAParameters.ModulusRaw, nonce)
 	return template
 }
 
 func (t *wrappedTPM20) rsaEkTemplate() tpm2.Public {
 	if t == nil || t.rwc == nil {
-		return defaultRSAEKTemplate
+		return tcg.DefaultRSA2048EKTemplate
 	}
 	if t.tpmRSAEkTemplate != nil {
 		return *t.tpmRSAEkTemplate
@@ -77,13 +79,13 @@ func (t *wrappedTPM20) rsaEkTemplate() tpm2.Public {
 
 func eccEkTemplate(rwc io.ReadWriter) tpm2.Public {
 	if rwc == nil {
-		return defaultECCEKTemplate
+		return tcg.DefaultECCP256EKTemplate
 	}
-	nonce, err := tpm2.NVReadEx(rwc, nvramECCEkNonceIndex, tpm2.HandleOwner, "", 0)
+	nonce, err := tpm2.NVReadEx(rwc, tcg.EKNonceECCP256Index, tpm2.HandleOwner, "", 0)
 	if err != nil {
-		return defaultECCEKTemplate
+		return tcg.DefaultECCP256EKTemplate
 	}
-	template := defaultECCEKTemplate
+	template := tcg.DefaultECCP256EKTemplate
 	copy(template.ECCParameters.Point.XRaw, nonce)
 	return template
 }
@@ -152,13 +154,13 @@ func getEndorsementKeyHandle(rwc io.ReadWriter, ek *EK) (tpmutil.Handle, bool, e
 
 	if ek == nil {
 		// The default is RSA for backward compatibility.
-		ekHandle = commonRSAEkEquivalentHandle
+		ekHandle = tcg.EKKeyRSA2048Handle
 		ekTemplate = rsaEkTemplate(rwc)
 	} else {
 		ekHandle = ek.handle
 		if ekHandle == 0 {
 			// Assume RSA EK handle if it was not provided.
-			ekHandle = commonRSAEkEquivalentHandle
+			ekHandle = tcg.EKKeyRSA2048Handle
 		}
 		var err error
 		ekTemplate, err = ekTemplateForPublic(rwc, ek.Public)
@@ -199,9 +201,9 @@ func (t *wrappedTPM20) getStorageRootKeyHandle(parent ParentKeyConfig) (tpmutil.
 	var srkTemplate tpm2.Public
 	switch parent.Algorithm {
 	case RSA:
-		srkTemplate = defaultRSASRKTemplate
+		srkTemplate = tcg.DefaultRSASRKTemplate
 	case ECDSA:
-		srkTemplate = defaultECCSRKTemplate
+		srkTemplate = tcg.DefaultECCSRKTemplate
 	default:
 		return 0, false, fmt.Errorf("unsupported SRK algorithm: %v", parent.Algorithm)
 	}
@@ -221,14 +223,14 @@ func serializePublicKey(pub crypto.PublicKey) (string, error) {
 	return base64.StdEncoding.EncodeToString(derKey), nil
 }
 
-// Unfortunatelly some TPMs have a non rsa2048 key in the commonRSAEkEquivalentHandle
+// Unfortunatelly some TPMs have a non rsa2048 key in the tcg.EKKeyRSA2048Handle
 // handle location. Thus we need an alternative handle to use for both creating
 // and searching for the rsa2048 ek.
 // The "Registry-of-Reserved-TPM-2.0-Handles-and-Localities-Version 1.2"  section 2.3.1
 // asserts that persistent EK handles should be in the range 0x8101000-0x810100FF
 // Thus any value in this range is acceptable, so we arbitrarily chose
 // a value inmediatelly after the ECC (p256) handle.
-const altRSAEkEquivalentHandle = commonECCEkEquivalentHandle + 1
+const altRSAEkEquivalentHandle = tcg.EKKeyECCP256Handle + 1
 
 // creates a map of a base64 pkcs8 encoding of public keys to handles
 func (t *wrappedTPM20) getKeyHandleKeyMap() (map[string]tpmutil.Handle, map[tpmutil.Handle]struct{}, error) {
@@ -239,8 +241,8 @@ func (t *wrappedTPM20) getKeyHandleKeyMap() (map[string]tpmutil.Handle, map[tpmu
 	// "tpm2_getcap handles-persistent". However we want to limit the number of locations
 	// to probe as accessing the tpm is a relatively slow path.
 	knownHandlesToSearch := []tpmutil.Handle{
-		commonRSAEkEquivalentHandle,
-		commonECCEkEquivalentHandle,
+		tcg.EKKeyRSA2048Handle,
+		tcg.EKKeyECCP256Handle,
 		altRSAEkEquivalentHandle,
 	}
 	for _, keyHandle := range knownHandlesToSearch {
@@ -266,8 +268,8 @@ func (t *wrappedTPM20) getKeyHandleKeyMap() (map[string]tpmutil.Handle, map[tpmu
 
 func (t *wrappedTPM20) create2048RSAEKInAvailableSlot(handleFoundMap map[tpmutil.Handle]struct{}) (tpmutil.Handle, error) {
 	rsakeyHandles := []tpmutil.Handle{
-		commonRSAEkEquivalentHandle,
-		altRSAEkEquivalentHandle,
+		tcg.EKKeyRSA2048Handle,
+		tcg.EKKeyAltRSA2048Handle,
 	}
 	for _, targetHandle := range rsakeyHandles {
 		_, handleInUse := handleFoundMap[targetHandle]
@@ -286,7 +288,7 @@ func (t *wrappedTPM20) create2048RSAEKInAvailableSlot(handleFoundMap map[tpmutil
 
 func (t *wrappedTPM20) ekCertificates() ([]EK, error) {
 	var res []EK
-	certIndexes := []int{nvramRSACertIndex, nvramECCCertIndex}
+	certIndexes := []tpmutil.Handle{tcg.EKCertRSA2048Index, tcg.EKCertECCP256Index}
 	keyHandleMap, handleFoundMap, err := t.getKeyHandleKeyMap()
 	if err != nil {
 		return nil, err
@@ -299,7 +301,7 @@ func (t *wrappedTPM20) ekCertificates() ([]EK, error) {
 			}
 
 			handleToUse, keyfound := keyHandleMap[serializedKey]
-			if !keyfound && certIndex == nvramRSACertIndex {
+			if !keyfound && certIndex == tcg.EKCertRSA2048Index {
 				handleToUse, err = t.create2048RSAEKInAvailableSlot(handleFoundMap)
 				if err != nil {
 					return nil, err
@@ -316,9 +318,9 @@ func (t *wrappedTPM20) ekCertificates() ([]EK, error) {
 }
 
 func (t *wrappedTPM20) eks() ([]EK, error) {
-	if cert, err := readEKCertFromNVRAM20(t.rwc, nvramRSACertIndex); err == nil {
+	if cert, err := readEKCertFromNVRAM20(t.rwc, tcg.EKCertRSA2048Index); err == nil {
 		return []EK{
-			{Public: crypto.PublicKey(cert.PublicKey), Certificate: cert, handle: commonRSAEkEquivalentHandle},
+			{Public: crypto.PublicKey(cert.PublicKey), Certificate: cert, handle: tcg.EKKeyRSA2048Handle},
 		}, nil
 	}
 
@@ -350,7 +352,7 @@ func (t *wrappedTPM20) eks() ([]EK, error) {
 		{
 			Public:         ekPub,
 			CertificateURL: certificateURL,
-			handle:         commonRSAEkEquivalentHandle,
+			handle:         tcg.EKKeyRSA2048Handle,
 		},
 	}, nil
 }
@@ -416,7 +418,7 @@ func (t *wrappedTPM20) newAK(opts *AKConfig) (*AK, error) {
 func (t *wrappedTPM20) newKey(ak *AK, opts *KeyConfig) (*Key, error) {
 	k, ok := ak.ak.(*wrappedKey20)
 	if !ok {
-		return nil, fmt.Errorf("expected *wrappedKey20, got: %T", k)
+		return nil, fmt.Errorf("expected *wrappedKey20, got: %T", ak.ak)
 	}
 
 	kAlg, err := k.algorithm()
@@ -451,7 +453,7 @@ func (t *wrappedTPM20) newKeyCertifiedByKey(ck certifyingKey, opts *KeyConfig) (
 		return nil, fmt.Errorf("certifyByKey() failed: %v", err)
 	}
 	if !bytes.Equal(pub, cp.Public) {
-		return nil, fmt.Errorf("certified incorrect key, expected: %v, certified: %v", pub, cp.Public)
+		return nil, fmt.Errorf("certified incorrect key, expected: %x, certified: %x", pub, cp.Public)
 	}
 
 	// Pack the raw structure into a TPMU_SIGNATURE.
@@ -732,27 +734,15 @@ func (k *wrappedKey20) activateCredential(tb tpmBase, in EncryptedCredential, ek
 		return nil, err
 	}
 
-	sessHandle, _, err := tpm2.StartAuthSession(
-		t.rwc,
-		tpm2.HandleNull,  /*tpmKey*/
-		tpm2.HandleNull,  /*bindKey*/
-		make([]byte, 16), /*nonceCaller*/
-		nil,              /*secret*/
-		tpm2.SessionPolicy,
-		tpm2.AlgNull,
-		tpm2.AlgSHA256)
+	sessHandle, auth, err := ekAuthSession(t.rwc)
 	if err != nil {
 		return nil, fmt.Errorf("creating session: %v", err)
 	}
 	defer tpm2.FlushContext(t.rwc, sessHandle)
 
-	if _, _, err := tpm2.PolicySecret(t.rwc, tpm2.HandleEndorsement, tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}, sessHandle, nil, nil, nil, 0); err != nil {
-		return nil, fmt.Errorf("tpm2.PolicySecret() failed: %v", err)
-	}
-
 	return tpm2.ActivateCredentialUsingAuth(t.rwc, []tpm2.AuthCommand{
 		{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession},
-		{Session: sessHandle, Attributes: tpm2.AttrContinueSession},
+		auth,
 	}, k.hnd, ekHnd, credential, secret)
 }
 
@@ -926,6 +916,42 @@ func signECDSA(rw io.ReadWriter, key tpmutil.Handle, digest []byte, curve ellipt
 	if _, ok := opts.(*rsa.PSSOptions); ok {
 		return nil, fmt.Errorf("cannot use rsa.PSSOptions with ECDSA key")
 	}
+
+	var scheme *tpm2.SigScheme
+	switch {
+	case opts == nil && runtime.GOOS == "windows":
+		// On Windows, if no scheme (nil) is specified, error code 0x12
+		// "unsupported or incompatible scheme" will be returned.
+		// This is prevented by selecting an appropriate signature
+		// scheme based on the curve.
+		var h tpm2.Algorithm
+		switch curve {
+		case elliptic.P224():
+			return nil, errors.New("curve P-224 is not supported")
+		case elliptic.P256():
+			h = tpm2.AlgSHA256
+		case elliptic.P384():
+			h = tpm2.AlgSHA384
+		case elliptic.P521():
+			h = tpm2.AlgSHA512
+		default:
+			return nil, fmt.Errorf("unsupported curve %s", curve)
+		}
+		scheme = &tpm2.SigScheme{
+			Alg:  tpm2.AlgECDSA,
+			Hash: h,
+		}
+	case opts != nil:
+		h, err := tpm2.HashToAlgorithm(opts.HashFunc())
+		if err != nil {
+			return nil, fmt.Errorf("incorrect hash algorithm: %v", err)
+		}
+		scheme = &tpm2.SigScheme{
+			Alg:  tpm2.AlgECDSA,
+			Hash: h,
+		}
+	}
+
 	// https://cs.opensource.google/go/go/+/refs/tags/go1.19.2:src/crypto/ecdsa/ecdsa.go;l=181
 	orderBits := curve.Params().N.BitLen()
 	orderBytes := (orderBits + 7) / 8
@@ -941,7 +967,7 @@ func signECDSA(rw io.ReadWriter, key tpmutil.Handle, digest []byte, curve ellipt
 	// that may have been dropped when converting the digest to an integer
 	digest = ret.FillBytes(digest)
 
-	sig, err := tpm2.Sign(rw, key, "", digest, validation, nil)
+	sig, err := tpm2.Sign(rw, key, "", digest, validation, scheme)
 	if err != nil {
 		return nil, fmt.Errorf("cannot sign: %v", err)
 	}
@@ -991,7 +1017,11 @@ func (k *wrappedKey20) blobs() ([]byte, []byte, error) {
 }
 
 func (k *wrappedKey20) algorithm() (Algorithm, error) {
-	tpmPub, err := tpm2.DecodePublic(k.public)
+	return algorithmFromPublicKeyBytes(k.public)
+}
+
+func algorithmFromPublicKeyBytes(public []byte) (Algorithm, error) {
+	tpmPub, err := tpm2.DecodePublic(public)
 	if err != nil {
 		return "", fmt.Errorf("decode public key: %v", err)
 	}
