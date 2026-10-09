@@ -22,131 +22,32 @@ package attest
 import (
 	"bytes"
 	"crypto"
-	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"io"
-	"math/big"
+	"slices"
 	"testing"
-	"time"
 
+	"github.com/google/go-attestation/tcg"
+	"github.com/google/go-attestation/tpmsim"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-tpm-tools/simulator"
 	"github.com/google/go-tpm/legacy/tpm2"
+	"github.com/google/go-tpm/tpmutil"
 )
 
-func setupSimulatedTPM(t *testing.T) (*simulator.Simulator, *TPM) {
+func setupSimulatedTPM(t *testing.T, opts ...tpmsim.Option) (*tpmsim.Simulator, *TPM) {
 	t.Helper()
-	tpm, err := simulator.Get()
+	sim := tpmsim.NewT(t, opts...)
+	attestTPM, err := OpenTPM(&OpenConfig{CommandChannel: &fakeCmdChannel{sim.TPM()}})
 	if err != nil {
-		t.Fatal(err)
-	}
-	attestTPM, err := OpenTPM(&OpenConfig{CommandChannel: &fakeCmdChannel{tpm}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tpm, attestTPM
-}
-
-func setupSimulatedTPMWithECCEK(t *testing.T) (*simulator.Simulator, *TPM) {
-	t.Helper()
-	sim, err := simulator.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := provisionECCEK(sim); err != nil {
-		sim.Close()
-		t.Fatalf("failed to provision ECC EK: %v", err)
-	}
-	attestTPM, err := OpenTPM(&OpenConfig{CommandChannel: &fakeCmdChannel{sim}})
-	if err != nil {
-		sim.Close()
-		t.Fatal(err)
+		t.Fatalf("OpenTPM() failed: %v", err)
 	}
 	return sim, attestTPM
-}
-
-func provisionECCEK(sim io.ReadWriter) error {
-	ekHnd, pubKey, err := tpm2.CreatePrimary(sim, tpm2.HandleEndorsement, tpm2.PCRSelection{}, "", "", defaultECCEKTemplate)
-	if err != nil {
-		return fmt.Errorf("CreatePrimary failed: %v", err)
-	}
-	defer tpm2.FlushContext(sim, ekHnd)
-
-	err = tpm2.EvictControl(sim, "", tpm2.HandleOwner, ekHnd, commonECCEkEquivalentHandle)
-	if err != nil {
-		return fmt.Errorf("EvictControl failed: %v", err)
-	}
-
-	ecdsaPub, ok := pubKey.(*ecdsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("expected *ecdsa.PublicKey, got %T", pubKey)
-	}
-
-	certDer, err := generateDummyCert(ecdsaPub)
-	if err != nil {
-		return fmt.Errorf("generateDummyCert failed: %v", err)
-	}
-
-	attrs := tpm2.AttrOwnerWrite | tpm2.AttrAuthRead
-	err = tpm2.NVDefineSpace(sim, tpm2.HandleOwner, nvramECCCertIndex, "", "", nil, attrs, uint16(len(certDer)))
-	if err != nil {
-		return fmt.Errorf("NVDefineSpace failed: %v", err)
-	}
-
-	err = tpm2.NVWrite(sim, tpm2.HandleOwner, nvramECCCertIndex, "", certDer, 0)
-	if err != nil {
-		return fmt.Errorf("NVWrite failed: %v", err)
-	}
-
-	return nil
-}
-
-func generateDummyCert(pub crypto.PublicKey) ([]byte, error) {
-	caPriv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Dummy CA"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	caDer, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caPriv.PublicKey, caPriv)
-	if err != nil {
-		return nil, err
-	}
-	caCert, err := x509.ParseCertificate(caDer)
-	if err != nil {
-		return nil, err
-	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"Dummy Subject"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, template, caCert, pub, caPriv)
-	if err != nil {
-		return nil, err
-	}
-	return der, nil
 }
 
 func TestSimEK(t *testing.T) {
@@ -163,7 +64,7 @@ func TestSimEK(t *testing.T) {
 }
 
 func TestSimWrappedtpmEKCertificatesInternal(t *testing.T) {
-	sim, tpm := setupSimulatedTPM(t)
+	sim, tpm := setupSimulatedTPM(t, tpmsim.WithoutEK())
 	defer sim.Close()
 
 	eks, err := tpm.EKCertificates()
@@ -182,7 +83,7 @@ func TestSimWrappedtpmEKCertificatesInternal(t *testing.T) {
 	// Use a wrappedTPM with the simulator as the tpm
 	wtpm := &wrappedTPM20{
 		interf: TPMInterfaceCommandChannel,
-		rwc:    &fakeCmdChannel{sim},
+		rwc:    &fakeCmdChannel{sim.TPM()},
 	}
 	eks, err = wtpm.ekCertificates()
 	if err != nil {
@@ -203,16 +104,112 @@ func TestSimWrappedtpmEKCertificatesInternal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if injected2khandle != commonRSAEkEquivalentHandle {
+	if injected2khandle != tcg.EKKeyRSA2048Handle {
 		t.Errorf("injected cert at not default handle when empty")
 	}
 	_, handleFoundMap, err = wtpm.getKeyHandleKeyMap()
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, ok := handleFoundMap[commonRSAEkEquivalentHandle]
+	_, ok := handleFoundMap[tcg.EKKeyRSA2048Handle]
 	if !ok {
 		t.Fatalf("injected key notfound")
+	}
+}
+
+// TestSimEKsAndEKCertificates uses the tpmsim package to provision a simulated
+// TPM with different EK configurations and verifies that the public attest APIs
+// EKs() and EKCertificates() report the expected keys and certificates.
+func TestSimEKsAndEKCertificates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []tpmsim.Option
+		// wantCertAlgs are the public-key algorithms expected from EKCertificates(),
+		// one entry per returned EK certificate.
+		wantCertAlgs []x509.PublicKeyAlgorithm
+		// wantEKsHasCert indicates whether EKs()[0].Certificate should be populated.
+		// EKs() only inspects the RSA cert NVRAM index, so an ECC-only TPM yields a
+		// freshly-created RSA EK without a certificate.
+		wantEKsHasCert bool
+	}{
+		{
+			name:           "RSA_2048",
+			opts:           []tpmsim.Option{tpmsim.WithEK(tpmsim.WithRSAKey(2048))},
+			wantCertAlgs:   []x509.PublicKeyAlgorithm{x509.RSA},
+			wantEKsHasCert: true,
+		},
+		{
+			name:           "ECC_P256",
+			opts:           []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P256()))},
+			wantCertAlgs:   []x509.PublicKeyAlgorithm{x509.ECDSA},
+			wantEKsHasCert: false,
+		},
+		{
+			name:           "ECC_P384",
+			opts:           []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P384()))},
+			wantCertAlgs:   []x509.PublicKeyAlgorithm{x509.ECDSA},
+			wantEKsHasCert: false,
+		},
+		{
+			name:           "ECC_P521",
+			opts:           []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P521()))},
+			wantCertAlgs:   []x509.PublicKeyAlgorithm{x509.ECDSA},
+			wantEKsHasCert: false,
+		},
+		{
+			name: "RSA_and_ECC_P256",
+			opts: []tpmsim.Option{
+				tpmsim.WithEK(tpmsim.WithRSAKey(2048)),
+				tpmsim.WithEK(tpmsim.WithECKey(elliptic.P256())),
+			},
+			wantCertAlgs:   []x509.PublicKeyAlgorithm{x509.RSA, x509.ECDSA},
+			wantEKsHasCert: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sim := tpmsim.NewT(t, tc.opts...)
+			defer sim.Close()
+
+			tpm, err := OpenTPM(&OpenConfig{CommandChannel: &fakeCmdChannel{sim.TPM()}})
+			if err != nil {
+				t.Fatalf("OpenTPM() failed: %v", err)
+			}
+
+			// --- EKCertificates() ---
+			certEKs, err := tpm.EKCertificates()
+			if err != nil {
+				t.Fatalf("EKCertificates() failed: %v", err)
+			}
+			var gotAlgs []x509.PublicKeyAlgorithm
+			for _, ek := range certEKs {
+				if ek.Certificate == nil {
+					t.Errorf("EKCertificates() returned an EK with nil Certificate")
+					continue
+				}
+				if ek.Public == nil {
+					t.Errorf("EKCertificates() returned an EK with nil Public")
+				}
+				gotAlgs = append(gotAlgs, ek.Certificate.PublicKeyAlgorithm)
+			}
+			slices.Sort(gotAlgs)
+			wantAlgs := slices.Clone(tc.wantCertAlgs)
+			slices.Sort(wantAlgs)
+			if !cmp.Equal(gotAlgs, wantAlgs) {
+				t.Errorf("EKCertificates() public-key algorithms = %v, want %v", gotAlgs, wantAlgs)
+			}
+
+			// --- EKs() ---
+			eks, err := tpm.EKs()
+			if err != nil {
+				t.Fatalf("EKs() failed: %v", err)
+			}
+			if len(eks) == 0 || eks[0].Public == nil {
+				t.Fatalf("EKs() = %v, want at least 1 EK with a populated Public key", eks)
+			}
+			if tc.wantEKsHasCert && eks[0].Certificate == nil {
+				t.Errorf("EKs()[0].Certificate = nil, want a populated certificate")
+			}
+		})
 	}
 }
 
@@ -282,15 +279,55 @@ func TestSimAKCreateAndLoad(t *testing.T) {
 }
 
 func TestSimActivateCredential(t *testing.T) {
-	testActivateCredential(t, false)
+	for _, tc := range []struct {
+		name string
+		opts []tpmsim.Option
+		// withoutEK indicates whether to also test the ActivateCredential() API.
+		// If false, the test will only test the ActivateCredentialWithEK() API.
+		// ActivateCredential() only supports RSA EKs.
+		withoutEK bool
+	}{
+		{
+			name:      "RSA_2048",
+			opts:      []tpmsim.Option{tpmsim.WithEK(tpmsim.WithRSAKey(2048))},
+			withoutEK: true,
+		},
+		{
+			name: "ECC_P256",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P256()))},
+		},
+		{
+			name: "ECC_P384",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P384()))},
+		},
+		{
+			name: "ECC_P521",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P521()))},
+		},
+		{
+			name: "RSA_and_ECC_P256",
+			opts: []tpmsim.Option{
+				tpmsim.WithEK(tpmsim.WithRSAKey(2048)),
+				tpmsim.WithEK(tpmsim.WithECKey(elliptic.P256())),
+			},
+			withoutEK: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("WithEK", func(t *testing.T) {
+				testActivateCredential(t, true, tc.opts...)
+			})
+			if tc.withoutEK {
+				t.Run("WithoutEK", func(t *testing.T) {
+					testActivateCredential(t, false, tc.opts...)
+				})
+			}
+		})
+	}
 }
 
-func TestSimActivateCredentialWithEK(t *testing.T) {
-	testActivateCredential(t, true)
-}
-
-func testActivateCredential(t *testing.T, useEK bool) {
-	sim, tpm := setupSimulatedTPM(t)
+func testActivateCredential(t *testing.T, useEK bool, opts ...tpmsim.Option) {
+	sim, tpm := setupSimulatedTPM(t, opts...)
 	defer sim.Close()
 
 	EKs, err := tpm.EKs()
@@ -411,6 +448,170 @@ func TestSimQuoteAndVerifyAll(t *testing.T) {
 	}
 }
 
+func TestSimVerifyRejectsDuplicatePCRs(t *testing.T) {
+	// PCR 16 is the debug PCR, so it can be extended freely in the simulator.
+	const testPCRIndex = 16
+
+	sim, tpm := setupSimulatedTPM(t)
+	defer sim.Close()
+
+	ak, err := tpm.NewAK(nil)
+	if err != nil {
+		t.Fatalf("NewAK() failed: %v", err)
+	}
+	defer ak.Close(tpm)
+
+	for _, s := range []string{"genuine-bootloader", "genuine-kernel"} {
+		d := sha256.Sum256([]byte(s))
+		if err := tpm2.PCRExtend(sim.TPM(), tpmutil.Handle(testPCRIndex), tpm2.AlgSHA256, d[:], ""); err != nil {
+			t.Fatalf("PCRExtend() failed: %v", err)
+		}
+	}
+
+	realPCRs, err := tpm.PCRs(HashSHA256)
+	if err != nil {
+		t.Fatalf("tpm.PCRs() failed: %v", err)
+	}
+
+	var realPCR PCR
+	for _, p := range realPCRs {
+		if p.Index == testPCRIndex {
+			realPCR = p
+		}
+	}
+
+	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	quote, err := ak.QuotePCRs(tpm, nonce, HashSHA256, []int{testPCRIndex})
+	if err != nil {
+		t.Fatalf("ak.QuotePCRs() failed: %v", err)
+	}
+
+	pub, err := ParseAKPublic(ak.AttestationParameters().Public)
+	if err != nil {
+		t.Fatalf("ParseAKPublic() failed: %v", err)
+	}
+
+	// Sanity check: the genuine PCR alone verifies against the quote, so any
+	// failure below is due to the duplicate entries.
+	if err := pub.VerifyAll([]Quote{*quote}, []PCR{realPCR}, nonce); err != nil {
+		t.Fatalf("VerifyAll() with genuine PCR failed: %v", err)
+	}
+
+	// A forged single-event log for the test PCR, and the PCR value it replays to.
+	forgedEvt := sha256.Sum256([]byte("forged-bootloader"))
+	h := sha256.New()
+	h.Write(make([]byte, sha256.Size))
+	h.Write(forgedEvt[:])
+	forgedPCR := PCR{Index: testPCRIndex, DigestAlg: crypto.SHA256, Digest: h.Sum(nil)}
+	forgedLog := &EventLog{
+		Algs: []HashAlg{HashSHA256},
+		rawEvents: []rawEvent{{
+			sequence: 1,
+			index:    testPCRIndex,
+			typ:      EventType(0x80000003), // EV_EFI_BOOT_SERVICES_APPLICATION
+			data:     []byte("forged-bootloader"),
+			digests:  []digest{{hash: crypto.SHA256, data: forgedEvt[:]}},
+		}},
+	}
+
+	for _, test := range []struct {
+		name string
+		pcrs []PCR
+	}{
+		{"forged first", []PCR{forgedPCR, realPCR}},
+		{"forged last", []PCR{realPCR, forgedPCR}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := pub.VerifyAll([]Quote{*quote}, test.pcrs, nonce); err == nil {
+				t.Error("VerifyAll() returned nil, want error for duplicate PCR entries")
+			}
+			if err := pub.Verify(*quote, test.pcrs, nonce); err == nil {
+				t.Error("Verify() returned nil, want error for duplicate PCR entries")
+			}
+			for _, p := range test.pcrs {
+				if p.QuoteVerified() {
+					t.Errorf("PCR %d (digest %x) marked quote-verified", p.Index, p.Digest)
+				}
+			}
+			if _, err := forgedLog.Verify(test.pcrs); err == nil {
+				t.Error("EventLog.Verify() returned nil, want error for duplicate PCR entries")
+			}
+		})
+	}
+}
+
+func TestSimVerifyRejectsWrongSizePCRDigests(t *testing.T) {
+	// PCRs 16 and 23 can be extended freely in the simulator.
+	testPCRIndexes := []int{16, 23}
+
+	sim, tpm := setupSimulatedTPM(t)
+	defer sim.Close()
+
+	ak, err := tpm.NewAK(nil)
+	if err != nil {
+		t.Fatalf("NewAK() failed: %v", err)
+	}
+	defer ak.Close(tpm)
+
+	for _, index := range testPCRIndexes {
+		d := sha256.Sum256([]byte{byte(index)})
+		if err := tpm2.PCRExtend(sim.TPM(), tpmutil.Handle(index), tpm2.AlgSHA256, d[:], ""); err != nil {
+			t.Fatalf("PCRExtend() failed: %v", err)
+		}
+	}
+
+	allPCRs, err := tpm.PCRs(HashSHA256)
+	if err != nil {
+		t.Fatalf("tpm.PCRs() failed: %v", err)
+	}
+
+	var realPCRs []PCR
+	for _, index := range testPCRIndexes {
+		for _, p := range allPCRs {
+			if p.Index == index {
+				realPCRs = append(realPCRs, p)
+			}
+		}
+	}
+
+	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	quote, err := ak.QuotePCRs(tpm, nonce, HashSHA256, testPCRIndexes)
+	if err != nil {
+		t.Fatalf("ak.QuotePCRs() failed: %v", err)
+	}
+
+	pub, err := ParseAKPublic(ak.AttestationParameters().Public)
+	if err != nil {
+		t.Fatalf("ParseAKPublic() failed: %v", err)
+	}
+
+	// Sanity check: the genuine PCRs verify against the quote, so any failure
+	// below is due to the digest sizes.
+	if err := pub.VerifyAll([]Quote{*quote}, realPCRs, nonce); err != nil {
+		t.Fatalf("VerifyAll() with genuine PCRs failed: %v", err)
+	}
+
+	// The quote covers the concatenation of the selected PCR values, so moving
+	// the boundary between two of them leaves the quoted digest unchanged.
+	first, second := realPCRs[0], realPCRs[1]
+	pcrs := []PCR{
+		{Index: first.Index, DigestAlg: crypto.SHA256, Digest: append(append([]byte{}, first.Digest...), second.Digest[0])},
+		{Index: second.Index, DigestAlg: crypto.SHA256, Digest: second.Digest[1:]},
+	}
+
+	if err := pub.VerifyAll([]Quote{*quote}, pcrs, nonce); err == nil {
+		t.Error("VerifyAll() returned nil, want error for wrong size PCR digests")
+	}
+	if err := pub.Verify(*quote, pcrs, nonce); err == nil {
+		t.Error("Verify() returned nil, want error for wrong size PCR digests")
+	}
+	for _, p := range pcrs {
+		if p.QuoteVerified() {
+			t.Errorf("PCR %d (digest %x) marked quote-verified", p.Index, p.Digest)
+		}
+	}
+}
+
 func TestSimAttestPlatform(t *testing.T) {
 	sim, tpm := setupSimulatedTPM(t)
 	defer sim.Close()
@@ -506,7 +707,7 @@ func TestSimEventLogPCRBanks(t *testing.T) {
 		sim, _ := setupSimulatedTPM(t)
 		defer sim.Close()
 		// Fetch all PCR banks from the TPM.
-		return fetchPCRBanksOrDie(t, sim)
+		return fetchPCRBanksOrDie(t, sim.TPM())
 	}()
 
 	for _, pcr := range pcrs {
@@ -530,7 +731,7 @@ func TestSimEventLogPCRBanks(t *testing.T) {
 				}
 				wantAlgs = append(wantAlgs, alg)
 			}
-			updatePCRBanksOrDie(t, sim, newPCRs)
+			updatePCRBanksOrDie(t, sim.SimulatorTPM(), newPCRs)
 
 			testEventLogHelper(t, tpm, wantAlgs)
 		})
@@ -586,12 +787,55 @@ func testPersistenceSRK(t *testing.T, parentConfig ParentKeyConfig) {
 	sim, tpm := setupSimulatedTPM(t)
 	defer sim.Close()
 
+	// Setting an Endorsement hierarchy password must not affect SRK creation,
+	// which uses the Owner (Storage) hierarchy.
+	auth := tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}
+	if err := tpm2.HierarchyChangeAuth(sim.TPM(), tpm2.HandleEndorsement, auth, "endorsement-secret"); err != nil {
+		t.Fatalf("tpm2.HierarchyChangeAuth(HandleEndorsement) failed: %v", err)
+	}
+
 	srkHnd, _, err := tpm.tpm.(*wrappedTPM20).getStorageRootKeyHandle(parentConfig)
 	if err != nil {
 		t.Fatalf("getStorageRootKeyHandle() failed: %v", err)
 	}
 	if srkHnd != parentConfig.Handle {
 		t.Fatalf("bad SRK-equivalent handle: got 0x%x, wanted 0x%x", srkHnd, parentConfig.Handle)
+	}
+
+	// Verify the persisted SRK matches the primary key derived under tpm2.HandleOwner.
+	var srkTemplate tpm2.Public
+	switch parentConfig.Algorithm {
+	case RSA:
+		srkTemplate = tcg.DefaultRSASRKTemplate
+	case ECDSA:
+		srkTemplate = tcg.DefaultECCSRKTemplate
+	default:
+		t.Fatalf("unsupported algorithm: %v", parentConfig.Algorithm)
+	}
+	wantHnd, _, err := tpm2.CreatePrimary(sim.TPM(), tpm2.HandleOwner, tpm2.PCRSelection{}, "", "", srkTemplate)
+	if err != nil {
+		t.Fatalf("tpm2.CreatePrimary(HandleOwner) failed: %v", err)
+	}
+	defer tpm2.FlushContext(sim.TPM(), wantHnd)
+
+	gotPub, _, _, err := tpm2.ReadPublic(sim.TPM(), srkHnd)
+	if err != nil {
+		t.Fatalf("tpm2.ReadPublic(srkHnd) failed: %v", err)
+	}
+	wantPub, _, _, err := tpm2.ReadPublic(sim.TPM(), wantHnd)
+	if err != nil {
+		t.Fatalf("tpm2.ReadPublic(wantHnd) failed: %v", err)
+	}
+	gotKey, err := gotPub.Key()
+	if err != nil {
+		t.Fatalf("gotPub.Key() failed: %v", err)
+	}
+	wantKey, err := wantPub.Key()
+	if err != nil {
+		t.Fatalf("wantPub.Key() failed: %v", err)
+	}
+	if !cmp.Equal(gotKey, wantKey) {
+		t.Errorf("SRK public key at 0x%x does not match primary key created under tpm2.HandleOwner", srkHnd)
 	}
 
 	srkHnd, p, err := tpm.tpm.(*wrappedTPM20).getStorageRootKeyHandle(parentConfig)
@@ -717,87 +961,159 @@ func TestSignMsg(t *testing.T) {
 }
 
 func TestSimCertifyWithDecryptionEk(t *testing.T) {
-	sim, tpm := setupSimulatedTPM(t)
-	defer sim.Close()
+	for _, tc := range []struct {
+		name string
+		opts []tpmsim.Option
+	}{
+		{
+			name: "RSA",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithRSAKey(2048))},
+		},
+		{
+			name: "ECC_P256",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P256()))},
+		},
+		{
+			name: "ECC_P384",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P384()))},
+		},
+		{
+			name: "ECC_P521",
+			opts: []tpmsim.Option{tpmsim.WithEK(tpmsim.WithECKey(elliptic.P521()))},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sim := tpmsim.NewT(t, tc.opts...)
+			defer sim.Close()
 
-	EKs, err := tpm.EKs()
-	if err != nil {
-		t.Fatalf("EKs() failed: %v", err)
-	}
-	if len(EKs) == 0 {
-		t.Fatalf("No suitable EK found")
-	}
-	var rsaEk *EK
-	for _, ek := range EKs {
-		if _, ok := ek.Public.(*rsa.PublicKey); ok {
-			rsaEk = &ek
-			break
-		}
-	}
-	if rsaEk == nil {
-		t.Fatalf("No suitable RSA EK found")
-	}
+			tpm, err := OpenTPM(&OpenConfig{CommandChannel: &fakeCmdChannel{sim.TPM()}})
+			if err != nil {
+				t.Fatalf("OpenTPM() failed: %v", err)
+			}
 
-	ak, err := tpm.NewAK(nil)
-	if err != nil {
-		t.Fatalf("NewAK() failed: %v", err)
-	}
-	defer ak.Close(tpm)
+			EKs, err := tpm.EKCertificates()
+			if err != nil {
+				t.Fatalf("EKCertificates() failed: %v", err)
+			}
+			if len(EKs) == 0 {
+				t.Fatalf("No EK certificates found")
+			}
+			ek := &EKs[0]
 
-	challenge, hmacKey, err := GenerateEkChallenge(rsaEk.Public)
-	if err != nil {
-		t.Fatalf("GenerateEkChallenge() failed: %v", err)
-	}
+			ak, err := tpm.NewAK(nil)
+			if err != nil {
+				t.Fatalf("NewAK() failed: %v", err)
+			}
+			defer ak.Close(tpm)
 
-	certParams, err := ak.CertifyWithDecryptionEk(tpm, rsaEk, *challenge)
-	if err != nil {
-		t.Fatalf("CertifyWithDecryptionEk() failed: %v", err)
-	}
+			challenge, hmacKey, err := GenerateEkChallenge(ek.Public)
+			if err != nil {
+				t.Fatalf("GenerateEkChallenge() failed: %v", err)
+			}
 
-	if err := VerifySolvedDecryptionEkChallenge(ak.AttestationParameters().Public, certParams, *hmacKey); err != nil {
-		t.Fatalf("VerifySolvedDecryptionEkChallenge() failed: %v", err)
+			certParams, err := ak.CertifyWithDecryptionEk(tpm, ek, *challenge)
+			if err != nil {
+				t.Fatalf("CertifyWithDecryptionEk() failed: %v", err)
+			}
+
+			if err := VerifySolvedDecryptionEkChallenge(ak.AttestationParameters().Public, certParams, *hmacKey); err != nil {
+				t.Fatalf("VerifySolvedDecryptionEkChallenge() failed: %v", err)
+			}
+		})
 	}
 }
 
-func TestSimCertifyWithDecryptionEkECC(t *testing.T) {
-	sim, tpm := setupSimulatedTPMWithECCEK(t)
+func TestSimVerifySolvedDecryptionEkChallengeRejectsNonAKs(t *testing.T) {
+	sim, tpm := setupSimulatedTPM(t)
 	defer sim.Close()
 
-	EKs, err := tpm.EKCertificates()
+	wt, ok := tpm.tpm.(*wrappedTPM20)
+	if !ok {
+		t.Fatalf("tpm.tpm is %T, want *wrappedTPM20", tpm.tpm)
+	}
+	srk, _, err := wt.getStorageRootKeyHandle(defaultParentConfig)
 	if err != nil {
-		t.Fatalf("EKCertificates() failed: %v", err)
+		t.Fatalf("getStorageRootKeyHandle() failed: %v", err)
 	}
-	if len(EKs) == 0 {
-		t.Fatalf("No EK certificates found")
+	eks, err := tpm.EKs()
+	if err != nil {
+		t.Fatalf("EKs() failed: %v", err)
 	}
-	var eccEk *EK
-	for _, ek := range EKs {
-		if _, ok := ek.Public.(*ecdsa.PublicKey); ok {
-			eccEk = &ek
-			break
-		}
+	if len(eks) == 0 {
+		t.Fatal("EKs() returned no EKs")
 	}
-	if eccEk == nil {
-		t.Fatalf("No suitable ECC EK found")
+	ek := eks[0]
+	ekHnd, _, err := getEndorsementKeyHandle(wt.rwc, &ek)
+	if err != nil {
+		t.Fatalf("getEndorsementKeyHandle() failed: %v", err)
 	}
 
-	ak, err := tpm.NewAK(nil)
-	if err != nil {
-		t.Fatalf("NewAK() failed: %v", err)
-	}
-	defer ak.Close(tpm)
+	rsaSignScheme := &tpm2.SigScheme{Alg: tpm2.AlgRSASSA, Hash: tpm2.AlgSHA256}
+	for _, tc := range []struct {
+		name     string
+		template tpm2.Public
+		wantErr  bool
+	}{
+		{
+			name: "restricted signing key",
+			template: tpm2.Public{
+				Type:          tpm2.AlgRSA,
+				NameAlg:       tpm2.AlgSHA256,
+				Attributes:    tpm2.FlagSignerDefault,
+				RSAParameters: &tpm2.RSAParams{Sign: rsaSignScheme, KeyBits: 2048},
+			},
+		},
+		{
+			name: "unrestricted signing key",
+			template: tpm2.Public{
+				Type:          tpm2.AlgRSA,
+				NameAlg:       tpm2.AlgSHA256,
+				Attributes:    tpm2.FlagSignerDefault &^ tpm2.FlagRestricted,
+				RSAParameters: &tpm2.RSAParams{Sign: rsaSignScheme, KeyBits: 2048},
+			},
+			wantErr: true,
+		},
+		{
+			name: "restricted decryption key",
+			template: tpm2.Public{
+				Type:       tpm2.AlgRSA,
+				NameAlg:    tpm2.AlgSHA256,
+				Attributes: tpm2.FlagStorageDefault,
+				RSAParameters: &tpm2.RSAParams{
+					Symmetric: &tpm2.SymScheme{Alg: tpm2.AlgAES, KeyBits: 128, Mode: tpm2.AlgCFB},
+					KeyBits:   2048,
+				},
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			blob, pub, _, _, _, err := tpm2.CreateKey(wt.rwc, srk, tpm2.PCRSelection{}, "", "", tc.template)
+			if err != nil {
+				t.Fatalf("CreateKey() failed: %v", err)
+			}
+			hnd, _, err := tpm2.Load(wt.rwc, srk, "", pub, blob)
+			if err != nil {
+				t.Fatalf("Load() failed: %v", err)
+			}
+			defer tpm2.FlushContext(wt.rwc, hnd)
 
-	challenge, hmacKey, err := GenerateEkChallenge(eccEk.Public)
-	if err != nil {
-		t.Fatalf("GenerateEkChallenge() failed: %v", err)
-	}
+			challenge, hmacKey, err := GenerateEkChallenge(ek.Public)
+			if err != nil {
+				t.Fatalf("GenerateEkChallenge() failed: %v", err)
+			}
+			certParams, err := certifyAKWithDecryptionEk(wt.rwc, ekHnd, hnd, pub, *challenge)
+			if err != nil {
+				t.Fatalf("certifyAKWithDecryptionEk() failed: %v", err)
+			}
 
-	certParams, err := ak.CertifyWithDecryptionEk(tpm, eccEk, *challenge)
-	if err != nil {
-		t.Fatalf("CertifyWithDecryptionEk() failed: %v", err)
-	}
-
-	if err := VerifySolvedDecryptionEkChallenge(ak.AttestationParameters().Public, certParams, *hmacKey); err != nil {
-		t.Fatalf("VerifySolvedDecryptionEkChallenge() failed: %v", err)
+			err = VerifySolvedDecryptionEkChallenge(pub, certParams, *hmacKey)
+			if tc.wantErr && err == nil {
+				t.Error("VerifySolvedDecryptionEkChallenge() returned nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("VerifySolvedDecryptionEkChallenge() failed: %v", err)
+			}
+		})
 	}
 }
